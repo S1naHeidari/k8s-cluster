@@ -1,0 +1,189 @@
+---
+- hosts: all
+  become: yes
+  vars:
+    pam_domain: "*"
+    pam_limits:
+      - comment:  "Open file descriptors: soft"
+        type:     soft
+        limit:    nofile
+        value:    4096
+      - comment:  "Open file descriptors: hard"
+        type:     hard
+        limit:    nofile
+        value:    65536
+      - comment:  "Number of processes available to a single user: soft"
+        type:     soft
+        limit:    nproc
+        value:    2047
+      - comment:  "Number of processes available to a single user: hard"
+        type:     hard
+        limit:    nproc
+        value:    16384
+      - comment:  "Size of the stack segment of the process: soft"
+        type:     soft
+        limit:    stack
+        value:    10240
+      - comment:  "Size of the stack segment of the process: hard"
+        type:     hard
+        limit:    stack
+        value:    32768
+      - comment:  "Maximum locked memory limit mem lock 90% of RAM: soft"
+        type:     soft
+        limit:    memlock
+        value:    1887437
+      - comment:  "Maximum locked memory limit mem lock 90% of RAM: hard"
+        type:     hard
+        limit:    memlock
+        value:    1887437
+  tasks:
+  - name: Set user limits
+    pam_limits:
+      domain: "{{ pam_domain }}"
+      limit_type: "{{ item.type }}"
+      limit_item: "{{ item.limit }}"
+      value: "{{ item.value }}"
+    loop: "{{ pam_limits }}"
+
+  - name: Install packages that allow apt to be used over HTTPS
+    apt:
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    ignore_errors: yes
+    vars:
+      packages:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg-agent
+      - software-properties-common
+
+  - name: Add an apt signing key for Docker
+    apt_key:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      state: present
+
+  - name: Add apt repository for stable version
+    apt_repository:
+      repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu bionic stable
+      state: present
+
+  - name: Install docker and its dependecies
+    apt: 
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    ignore_errors: yes
+    vars:
+      packages:
+      - docker-ce 
+      - docker-ce-cli 
+      - containerd.io
+    notify:
+      - docker status
+
+  - name: Add vagrant user to docker group
+    user:
+      name: vagrant
+      group: docker
+  
+  - name: Remove swapfile from /etc/fstab
+    mount:
+      name: "{{ item }}"
+      fstype: swap
+      state: absent
+    with_items:
+      - swap
+      - none
+
+  - name: Disable swap
+    command: swapoff -a
+    when: ansible_swaptotal_mb > 0
+  
+  - name: Download and add Kubernetes apt key to /etc/apt/keyrings
+    shell: mkdir -p -m 755 /etc/apt/keyrings
+    become: true
+
+  - name: Download the public signing key for the Kubernetes package repositories
+    shell: |
+      if [ -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg ]; then
+          sudo rm /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      fi
+      curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    become: true
+    register: install_result
+    until: install_result is succeeded
+    retries: 100
+    delay: 2
+
+  - name: 
+    shell: echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' | sudo -n tee /etc/apt/sources.list.d/kubernetes.list
+    become: true
+
+  - name: Install Kubernetes binaries
+    apt: 
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    ignore_errors: yes
+    vars:
+      packages:
+        - kubelet 
+        - kubeadm 
+        - kubectl
+
+  - name: Configure node-ip {{ node_ip }} at kubelet
+    lineinfile:
+      path: '/lib/systemd/system/kubelet.service.d/10-kubeadm.conf'
+      line: 'Environment="KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}"'
+      regexp: 'KUBELET_EXTRA_ARGS='
+      insertafter: '\[Service\]'
+      state: present
+    
+
+  - name: Restart kubelet
+    service:
+      name: kubelet
+      daemon_reload: yes
+      state: restarted
+    
+  - name: Delete configuration for containerd.conf as kubeadm is unable to detect containerd (see https://github.com/containerd/containerd/issues/4581)
+    file:
+      state: absent
+      path:  /etc/containerd/config.toml
+
+  - name: Restart containerd
+    service:
+      name: containerd
+      daemon_reload: yes
+      state: restarted
+  
+  - name: Initialize the Kubernetes cluster using kubeadm
+    command: kubeadm init --apiserver-advertise-address="192.168.56.10" --apiserver-cert-extra-sans="192.168.56.10"  --node-name k8s-master --pod-network-cidr=10.244.0.0/16
+
+
+  - name: Setup kubeconfig for vagrant user
+    command: "{{ item }}"
+    with_items:
+     - mkdir -p /home/vagrant/.kube
+     - cp -i /etc/kubernetes/admin.conf /home/vagrant/.kube/config
+     - chown vagrant:vagrant /home/vagrant/.kube/config
+  
+  # - name: Install calico pod network
+  #   become: false
+  #   command: kubectl create -f https://docs.projectcalico.org/v3.4/getting-started/kubernetes/installation/hosted/calico.yaml
+
+  - name: Generate join command
+    command: kubeadm token create --print-join-command
+    register: join_command
+    
+
+  - name: Copy join command to local file
+    become: false
+    local_action: copy content="{{ join_command.stdout_lines[0] }}" dest="./join-command"
+    
+
+  handlers:
+    - name: docker status
+      service: name=docker state=started
